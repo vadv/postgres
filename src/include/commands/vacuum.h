@@ -174,6 +174,7 @@ typedef struct VacAttrStats
 	Datum	   *exprvals;		/* access info for index fetch function */
 	bool	   *exprnulls;
 	int			rowstride;
+	int			multicolumn;
 } VacAttrStats;
 
 /* flag bits for VacuumParams->options */

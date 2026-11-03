@@ -1056,6 +1056,8 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			accessMethodId = get_table_am_oid(default_table_access_method, false);
 	}
 
+	BEGIN_TEMP_TABLE_SCOPE_SHARED(stmt->relation->relpersistence == RELPERSISTENCE_TEMP);
+
 	/*
 	 * Create the relation.  Inherited defaults and CHECK constraints are
 	 * passed in for immediate handling --- since they don't need parsing,
@@ -1373,6 +1375,8 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 */
 	relation_close(rel, NoLock);
 
+	END_TEMP_TABLE_SCOPE();
+
 	return address;
 }
 
@@ -1551,6 +1555,7 @@ RemoveRelations(DropStmt *drop)
 	ListCell   *cell;
 	int			flags = 0;
 	LOCKMODE	lockmode = AccessExclusiveLock;
+	bool		haveNonTempRelations = false;
 
 	/* DROP CONCURRENTLY uses a weaker lock, and has some restrictions */
 	if (drop->concurrent)
@@ -1694,9 +1699,17 @@ RemoveRelations(DropStmt *drop)
 		obj.objectSubId = 0;
 
 		add_exact_object_address(&obj, objects);
+
+		if (get_rel_persistence(relOid) != RELPERSISTENCE_TEMP)
+			haveNonTempRelations = true;
 	}
 
+	/* Don't send invalidation messages if and only all relations being deleted are temporary */
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(!haveNonTempRelations);
+
 	performMultipleDeletions(objects, drop->behavior, flags);
+
+	END_TEMP_TABLE_SCOPE();
 
 	free_object_addresses(objects);
 }
@@ -2200,6 +2213,8 @@ ExecuteTruncateGuts(List *explicit_rels,
 			continue;
 		}
 
+		BEGIN_TEMP_TABLE_SCOPE_LOCAL(rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP);
+
 		/*
 		 * Normally, we need a transaction-safe truncation here.  However, if
 		 * the table was either created in the current (sub)transaction or has
@@ -2260,6 +2275,8 @@ ExecuteTruncateGuts(List *explicit_rels,
 		}
 
 		pgstat_count_truncate(rel);
+
+		END_TEMP_TABLE_SCOPE();
 	}
 
 	/* Now go through the hash table, and truncate foreign tables */
@@ -4298,6 +4315,8 @@ RenameRelationInternal(Oid myrelid, const char *newrelname, bool is_internal, bo
 	targetrelation = relation_open(myrelid, is_index ? ShareUpdateExclusiveLock : AccessExclusiveLock);
 	namespaceId = RelationGetNamespace(targetrelation);
 
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(targetrelation->rd_rel->relpersistence == RELPERSISTENCE_TEMP);
+
 	/*
 	 * Find relation's pg_class tuple, and make sure newrelname isn't in use.
 	 */
@@ -4363,6 +4382,8 @@ RenameRelationInternal(Oid myrelid, const char *newrelname, bool is_internal, bo
 	 * Close rel, but keep lock!
 	 */
 	relation_close(targetrelation, NoLock);
+	
+	END_TEMP_TABLE_SCOPE();
 }
 
 /*
@@ -5389,6 +5410,8 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
 	ObjectAddress address = InvalidObjectAddress;
 	Relation	rel = tab->rel;
 
+	BEGIN_TEMP_TABLE_SCOPE_SHARED(rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP);
+
 	switch (cmd->subtype)
 	{
 		case AT_AddColumn:		/* ADD COLUMN */
@@ -5689,6 +5712,8 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
 				 (int) cmd->subtype);
 			break;
 	}
+
+	END_TEMP_TABLE_SCOPE();
 
 	/*
 	 * Report the subcommand to interested event triggers.

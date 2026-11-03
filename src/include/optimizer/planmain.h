@@ -50,6 +50,9 @@ extern Plan *materialize_finished_plan(Plan *subplan);
 extern bool is_projection_capable_path(Path *path);
 extern bool is_projection_capable_plan(Plan *plan);
 
+extern Node * fix_indexqual_operand(Node *node, IndexOptInfo *index, int
+									indexcol);
+
 /* External use of these functions is deprecated: */
 extern Sort *make_sort_from_sortclauses(List *sortcls, Plan *lefttree);
 extern Agg *make_agg(List *tlist, List *qual,
@@ -111,6 +114,8 @@ extern bool remove_useless_outer_joins(PlannerInfo *root);
 extern bool reduce_unique_semijoins(PlannerInfo *root);
 extern bool query_supports_distinctness(Query *query);
 extern bool query_is_distinct_for(Query *query, List *colnos, List *opids);
+extern bool query_is_distinct_for_ext(PlannerInfo *subroot, Query *query,
+									  List *colnos, List *opids, List *collids);
 extern bool innerrel_is_unique(PlannerInfo *root,
 							   Relids joinrelids, Relids outerrelids, RelOptInfo *innerrel,
 							   JoinType jointype, List *restrictlist, bool force_cache);

@@ -36,7 +36,7 @@
 #include "optimizer/restrictinfo.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
-
+#include "catalog/pg_aggregate.h"
 
 /* XXX see PartCollMatchesExprColl */
 #define IndexCollMatchesExprColl(idxcollation, exprcollation) \
@@ -111,8 +111,6 @@ static List *build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 							   bool *skip_nonnative_saop);
 static List *build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 								List *clauses, List *other_clauses);
-static List *generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
-									  List *clauses, List *other_clauses);
 static Path *choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel,
 							   List *paths);
 static int	path_usage_comparator(const void *a, const void *b);
@@ -1059,6 +1057,86 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 		}
 	}
 
+	/* 
+	 * Allow queries like "SELECT COUNT(DISTINCT i) FROM t" to use index with NULLS FIRST attributes.
+	 * We check the criteria and build new pathkeys ignoring NULLS FIRST attribute from index.
+	 * TODO: The criteria should be refactored for more generic case.
+	 */
+	if (index_is_ordered &&
+		pathkeys_possibly_useful &&
+		root->hasNonPartialAggs &&
+		!root->hasJoinRTEs &&
+		!root->hasLateralRTEs &&
+		!root->hasHavingQual &&
+		!root->hasAlternativeSubPlans &&
+		!root->hasNonSerialAggs)
+	{
+		AggInfo *ainfo;
+		Aggref *aref;
+		SortGroupClause *sgc;
+		if (list_length(root->agginfos) == 1 &&
+			(ainfo=linitial_node(AggInfo,root->agginfos)) &&
+			(aref=linitial_node(Aggref,ainfo->aggrefs)) &&
+			list_length(aref->aggdistinct) == 1 &&
+			list_length(aref->aggorder) == 0 &&
+			aref->aggkind == AGGKIND_NORMAL &&
+			(sgc=linitial_node(SortGroupClause,aref->aggdistinct)) &&
+			!sgc->reverse_sort &&
+			!sgc->nulls_first)
+		{
+			ListCell *lc;
+
+			index_pathkeys = build_index_pathkeys(root, index, ForwardScanDirection);
+
+			foreach(lc,index_pathkeys)
+			{
+				PathKey *pk = (PathKey*)lfirst(lc);
+				if (pk->pk_nulls_first && pk->pk_cmptype == COMPARE_LT)
+					useful_pathkeys = lappend(useful_pathkeys, make_canonical_pathkey(root, pk->pk_eclass, pk->pk_opfamily, pk->pk_cmptype, false));
+				else
+					useful_pathkeys = lappend(useful_pathkeys, pk);
+			}
+
+			useful_pathkeys = truncate_useless_pathkeys(root, rel, useful_pathkeys);
+
+			if (useful_pathkeys)
+			{
+				ipath = create_index_path(root, index,
+										index_clauses,
+										NIL,
+										NIL,
+										useful_pathkeys,
+										ForwardScanDirection,
+										index_only_scan,
+										outer_relids,
+										loop_count,
+										false);
+				result = lappend(result, ipath);
+
+				if (index->amcanparallel &&
+					rel->consider_parallel && outer_relids == NULL &&
+					scantype != ST_BITMAPSCAN)
+				{
+					ipath = create_index_path(root, index,
+											index_clauses,
+											NIL,
+											NIL,
+											useful_pathkeys,
+											ForwardScanDirection,
+											index_only_scan,
+											outer_relids,
+											loop_count,
+											true);
+
+					if (ipath->path.parallel_workers > 0)
+						add_partial_path(rel, (Path *) ipath);
+					else
+						pfree(ipath);
+				}
+			}
+		}
+	}
+
 	return result;
 }
 
@@ -1625,7 +1703,7 @@ make_bitmap_paths_for_or_group(PlannerInfo *root, RelOptInfo *rel,
  * for the purpose of generating indexquals, but are not to be searched for
  * ORs.  (See build_paths_for_OR() for motivation.)
  */
-static List *
+List *
 generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 						 List *clauses, List *other_clauses)
 {
@@ -3911,7 +3989,6 @@ match_clause_to_ordering_op(IndexOptInfo *index,
 
 	return clause;
 }
-
 
 /****************************************************************************
  *				----  ROUTINES TO DO PARTIAL INDEX PREDICATE TESTS	----

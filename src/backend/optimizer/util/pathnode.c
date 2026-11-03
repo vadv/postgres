@@ -235,6 +235,18 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor)
 		/* ... but path2 fuzzily worse on startup, so path1 wins */
 		return COSTS_BETTER1;
 	}
+
+	if (IsA(path1, IndexPath) && IsA(path2, IndexPath))
+	{
+		IndexPath *ipath1 = (IndexPath*)path1;
+		IndexPath *ipath2 = (IndexPath*)path2;
+
+		if (ipath1->indexselectivity < ipath2->indexselectivity)
+			return COSTS_BETTER1;
+		else if (ipath1->indexselectivity > ipath2->indexselectivity)
+			return COSTS_BETTER2;
+	}
+
 	/* fuzzily the same on both costs */
 	return COSTS_EQUAL;
 
@@ -1288,7 +1300,7 @@ create_tidrangescan_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
- * create_append_path
+ * create_append_path_ext
  *	  Creates a path corresponding to an Append plan, returning the
  *	  pathnode.
  *
@@ -1300,12 +1312,12 @@ create_tidrangescan_path(PlannerInfo *root, RelOptInfo *rel,
  * by totalling the row estimates from the 'subpaths' list.
  */
 AppendPath *
-create_append_path(PlannerInfo *root,
+create_append_path_ext(PlannerInfo *root,
 				   RelOptInfo *rel,
 				   List *subpaths, List *partial_subpaths,
 				   List *pathkeys, Relids required_outer,
 				   int parallel_workers, bool parallel_aware,
-				   double rows)
+				   double rows, bool pull_tlist)
 {
 	AppendPath *pathnode = makeNode(AppendPath);
 	ListCell   *l;
@@ -1315,6 +1327,7 @@ create_append_path(PlannerInfo *root,
 	pathnode->path.pathtype = T_Append;
 	pathnode->path.parent = rel;
 	pathnode->path.pathtarget = rel->reltarget;
+	pathnode->pull_tlist = pull_tlist;
 
 	/*
 	 * If this is for a baserel (not a join or non-leaf partition), we prefer
@@ -1408,12 +1421,12 @@ create_append_path(PlannerInfo *root,
 			pathnode->path.total_cost = child->total_cost;
 		}
 		else
-			cost_append(pathnode);
+			cost_append_ext(pathnode, root);
 		/* Must do this last, else cost_append complains */
 		pathnode->path.pathkeys = child->pathkeys;
 	}
 	else
-		cost_append(pathnode);
+	cost_append_ext(pathnode, root);
 
 	/* If the caller provided a row estimate, override the computed value. */
 	if (rows >= 0)
@@ -1639,10 +1652,12 @@ create_material_path(RelOptInfo *rel, Path *subpath)
 {
 	MaterialPath *pathnode = makeNode(MaterialPath);
 
-	Assert(subpath->parent == rel);
+	Assert(subpath->parent == rel ||
+		  (bms_equal(subpath->parent->relids, rel->relids) &&
+		  subpath->pathtype == T_SubqueryScan));
 
 	pathnode->path.pathtype = T_Material;
-	pathnode->path.parent = rel;
+	pathnode->path.parent = subpath->parent;
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = subpath->param_info;
 	pathnode->path.parallel_aware = false;
@@ -1674,10 +1689,12 @@ create_memoize_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 {
 	MemoizePath *pathnode = makeNode(MemoizePath);
 
-	Assert(subpath->parent == rel);
+	Assert(subpath->parent == rel ||
+		  (bms_equal(subpath->parent->relids, rel->relids) &&
+		  subpath->pathtype == T_SubqueryScan));
 
 	pathnode->path.pathtype = T_Memoize;
-	pathnode->path.parent = rel;
+	pathnode->path.parent = subpath->parent;
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = subpath->param_info;
 	pathnode->path.parallel_aware = false;
@@ -1741,7 +1758,11 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 
 	/* Caller made a mistake if subpath isn't cheapest_total ... */
 	Assert(subpath == rel->cheapest_total_path);
-	Assert(subpath->parent == rel);
+
+	Assert(subpath->parent == rel ||
+		  (bms_equal(subpath->parent->relids, rel->relids) &&
+		  subpath->pathtype == T_SubqueryScan));
+
 	/* ... or if SpecialJoinInfo is the wrong one */
 	Assert(sjinfo->jointype == JOIN_SEMI);
 	Assert(bms_equal(rel->relids, sjinfo->syn_righthand));
@@ -1906,7 +1927,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode = makeNode(UniquePath);
 
 	pathnode->path.pathtype = T_Unique;
-	pathnode->path.parent = rel;
+	pathnode->path.parent = subpath->parent;
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = subpath->param_info;
 	pathnode->path.parallel_aware = false;
@@ -1968,6 +1989,41 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 
 			sub_tlist_colnos = translate_sub_tlist(uniq_exprs,
 												   rel->relid);
+
+			if (sub_tlist_colnos)
+			{
+				List	   *collids = list_copy(sjinfo->semi_operators);
+				ListCell   *lc;
+				bool		res;
+
+				foreach(lc, collids)
+				{
+					lfirst_oid(lc) = InvalidOid;
+				}
+
+				res = query_is_distinct_for_ext(rel->subroot,
+												rte->subquery,
+												sub_tlist_colnos,
+												sjinfo->semi_operators,
+												collids);
+
+				list_free(collids);
+
+				if (res)
+				{
+					pathnode->umethod = UNIQUE_PATH_NOOP;
+					pathnode->path.rows = rel->rows;
+					pathnode->path.startup_cost = subpath->startup_cost;
+					pathnode->path.total_cost = subpath->total_cost;
+					pathnode->path.pathkeys = subpath->pathkeys;
+
+					rel->cheapest_unique_path = (Path *) pathnode;
+
+					MemoryContextSwitchTo(oldcontext);
+
+					return pathnode;
+				}
+			}
 
 			if (sub_tlist_colnos &&
 				query_is_distinct_for(rte->subquery,
@@ -4212,9 +4268,13 @@ adjust_limit_rows_costs(double *rows,	/* in/out parameter */
 		if (count_rows > *rows)
 			count_rows = *rows;
 		if (input_rows > 0)
+		{
+			*startup_cost = *startup_cost +
+				2*(input_total_cost - input_startup_cost) / input_rows;
 			*total_cost = *startup_cost +
 				(input_total_cost - input_startup_cost)
 				* count_rows / input_rows;
+		}
 		*rows = count_rows;
 		if (*rows < 1)
 			*rows = 1;
@@ -4339,11 +4399,12 @@ reparameterize_path(PlannerInfo *root, Path *path,
 					i++;
 				}
 				return (Path *)
-					create_append_path(root, rel, childpaths, partialpaths,
+					create_append_path_ext(root, rel, childpaths, partialpaths,
 									   apath->path.pathkeys, required_outer,
 									   apath->path.parallel_workers,
 									   apath->path.parallel_aware,
-									   -1);
+									   -1,
+									   apath->pull_tlist);
 			}
 		case T_Material:
 			{

@@ -28,6 +28,7 @@
 #include "common/logging.h"
 #include "pgtar.h"
 #include "walmethods.h"
+#include "streamutil.h"
 
 /* Size of zlib buffer for .tar.gz */
 #define ZLIB_OUT_SIZE 4096
