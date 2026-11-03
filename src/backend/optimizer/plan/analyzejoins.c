@@ -81,7 +81,7 @@ static bool reduce_semijoin_in_jointree(Node *jtnode, Relids syn_righthand);
 static bool rel_supports_distinctness(PlannerInfo *root, RelOptInfo *rel);
 static bool rel_is_distinct_for(PlannerInfo *root, RelOptInfo *rel,
 								List *clause_list, List **extra_clauses);
-static bool query_is_distinct_for_with_collations(Query *query,
+static bool query_is_distinct_for_with_collations(PlannerInfo *subroot, Query *query,
 												  List *distinct_cols);
 static DistinctColInfo *distinct_col_search(int colno, List *distinct_cols);
 static bool is_innerrel_unique_for(PlannerInfo *root,
@@ -99,6 +99,10 @@ static void fixup_selfjoin_jointree(PlannerInfo *root, Node *jtnode, int relid,
 static List *fixup_selfjoin_quals(PlannerInfo *root, List *quals, int relid);
 static Node *replace_selfjoin_qual(Node *qual);
 static int	self_join_candidates_cmp(const void *a, const void *b);
+static bool rel_referenced_by_aggrefs(PlannerInfo *root, int relid);
+static void null_out_rel_in_query(PlannerInfo *root, RelOptInfo *rel);
+static Node *replace_var_with_null(Var *var,
+								   replace_rte_variables_context *context);
 
 
 /*
@@ -188,6 +192,99 @@ remove_useless_outer_joins(PlannerInfo *root)
 }
 
 /*
+ * null_out_rel_in_query
+ *		Replace all references to the given base relation in the query's
+ *		targetlist, HAVING/WHERE quals, and RETURNING list (as well as the
+ *		planner's processed targetlist) with NULL constants.
+ *
+ * This supports removing an outer join that is known to always null-extend
+ * its inner side, so that no reference to the inner side survives.
+ */
+static void
+null_out_rel_in_query(PlannerInfo *root, RelOptInfo *rel)
+{
+	Query	   *parse = root->parse;
+	int			varno = rel->relid;
+
+	/*
+	 * Use replace_rte_variables() to swap each Var of the target relation for
+	 * a NULL constant of the same type.  We must apply it to each top-level
+	 * expression field separately: handing it the whole Query would copy the
+	 * rangetable and thereby break root's RTE pointers.
+	 *
+	 * Our replacement callback never introduces a sublink, so we need not pass
+	 * outer_hasSubLinks.
+	 */
+	parse->targetList =
+		(List *) replace_rte_variables((Node *) parse->targetList,
+									   varno, 0, replace_var_with_null,
+									   NULL, NULL);
+	root->processed_tlist =
+		(List *) replace_rte_variables((Node *) root->processed_tlist,
+									   varno, 0, replace_var_with_null,
+									   NULL, NULL);
+	if (parse->havingQual)
+		parse->havingQual =
+			replace_rte_variables(parse->havingQual, varno, 0,
+								  replace_var_with_null, NULL, NULL);
+	if (parse->jointree && parse->jointree->quals)
+		parse->jointree->quals =
+			replace_rte_variables(parse->jointree->quals, varno, 0,
+								  replace_var_with_null, NULL, NULL);
+	if (parse->returningList)
+		parse->returningList =
+			(List *) replace_rte_variables((Node *) parse->returningList,
+										   varno, 0, replace_var_with_null,
+										   NULL, NULL);
+}
+
+/*
+ * Callback for replace_rte_variables() that replaces a Var belonging to the
+ * null-extended relation with a NULL constant of the same type.  A whole-row
+ * Var becomes a NULL constant of the relation's composite type, which is the
+ * correct representation of a null-extended row.
+ */
+static Node *
+replace_var_with_null(Var *var,
+					  replace_rte_variables_context *context)
+{
+	return (Node *) makeNullConst(var->vartype, var->vartypmod,
+								  var->varcollid);
+}
+
+/*
+ * rel_referenced_by_aggrefs
+ *		Check whether any aggregate tracked in root->agginfos references the
+ *		given relation.
+ *
+ * Aggrefs are also cached separately in root->agginfos by preprocess_aggrefs(),
+ * which runs before join removal.  Nulling out Vars of a removed relation in
+ * the query tree does not update those cached nodes, so a join whose inner
+ * side is used by an aggregate must not be removed.
+ */
+static bool
+rel_referenced_by_aggrefs(PlannerInfo *root, int relid)
+{
+	ListCell   *lc;
+
+	foreach(lc, root->agginfos)
+	{
+		AggInfo    *agginfo = lfirst_node(AggInfo, lc);
+		ListCell   *lc2;
+
+		foreach(lc2, agginfo->aggrefs)
+		{
+			Aggref	   *aggref = lfirst_node(Aggref, lc2);
+
+			if (bms_is_member(relid, pull_varnos(root, (Node *) aggref)))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/*
  * join_is_removable
  *	  Check whether we need not perform this special join at all, because
  *	  it will just duplicate its left input.
@@ -203,11 +300,15 @@ join_is_removable(PlannerInfo *root, SpecialJoinInfo *sjinfo)
 {
 	int			innerrelid;
 	RelOptInfo *innerrel;
+	RelOptInfo *outerrel = NULL;
+	int			outerrelid;
 	Relids		inputrelids;
 	Relids		joinrelids;
+	Relids		allowed;
 	List	   *clause_list = NIL;
 	ListCell   *l;
 	int			attroff;
+	bool		join_cond_is_false = false;
 
 	/*
 	 * Must be a left join to a single baserel, else we aren't going to be
@@ -236,14 +337,6 @@ join_is_removable(PlannerInfo *root, SpecialJoinInfo *sjinfo)
 
 	innerrel = find_base_rel(root, innerrelid);
 
-	/*
-	 * Before we go to the effort of checking whether any innerrel variables
-	 * are needed above the join, make a quick check to eliminate cases in
-	 * which we will surely be unable to prove uniqueness of the innerrel.
-	 */
-	if (!rel_supports_distinctness(root, innerrel))
-		return false;
-
 	/* Compute the relid set for the join we are considering */
 	inputrelids = bms_union(sjinfo->min_lefthand, sjinfo->min_righthand);
 	Assert(sjinfo->ojrelid != 0);
@@ -251,21 +344,119 @@ join_is_removable(PlannerInfo *root, SpecialJoinInfo *sjinfo)
 	joinrelids = bms_add_member(joinrelids, sjinfo->ojrelid);
 
 	/*
+	 * Find the single non-nullable side, if any.  The "join is provably
+	 * false" optimization below is restricted to the case where that side is
+	 * a single baserel, so that the set of restrictions we trust is simple.
+	 */
+	if (bms_get_singleton_member(sjinfo->min_lefthand, &outerrelid))
+		outerrel = find_base_rel(root, outerrelid);
+
+	/*
+	 * Scan the join clauses once, doing two things: collect the mergejoinable
+	 * clauses that might prove the inner rel distinct, and check whether the
+	 * outer join's own ON condition is provably not true given the
+	 * restrictions on the non-nullable side.
+	 *
+	 * The latter case means the join always null-extends its inner side.  Such
+	 * a join can be removed without proving any uniqueness; we only have to
+	 * replace the inner side's Vars with NULL constants.  This matters for
+	 * machine-generated queries containing long chains of LEFT JOINs that are
+	 * each predicated on constants resolvable from the outer side, where the
+	 * joins can never contribute a row yet otherwise trigger a huge
+	 * join-order search.
+	 */
+	foreach(l, innerrel->joininfo)
+	{
+		RestrictInfo *restrictinfo = (RestrictInfo *) lfirst(l);
+
+		/*
+		 * If the current join commutes with some other outer join(s) via
+		 * outer join identity 3, there will be multiple clones of its join
+		 * clauses in the joininfo list.  We want to consider only the
+		 * has_clone form of such clauses.  Processing more than one form
+		 * would be wasteful, and also some of the others would confuse the
+		 * RINFO_IS_PUSHED_DOWN test below.
+		 */
+		if (restrictinfo->is_clone)
+			continue;			/* ignore it */
+
+		/*
+		 * If it's not a join clause for this outer join, we can't use it.
+		 * Note that if the clause is pushed-down, then it is logically from
+		 * above the outer join, even if it references no other rels (it might
+		 * be from WHERE, for example).
+		 */
+		if (RINFO_IS_PUSHED_DOWN(restrictinfo, joinrelids))
+			continue;			/* ignore; not useful here */
+
+		/*
+		 * Check whether this ON-clause conjunct is provably not true.  We only
+		 * trust clauses that belong to this outer join's own ON list
+		 * (required_relids equal to the join's inputrels), reference only the
+		 * non-nullable side, and contain no mutable functions.
+		 */
+		if (outerrel != NULL &&
+			bms_equal(restrictinfo->required_relids, inputrelids) &&
+			bms_is_subset(pull_varnos(root, (Node *) restrictinfo->clause),
+						  sjinfo->min_lefthand) &&
+			!contain_mutable_functions((Node *) restrictinfo->clause))
+		{
+			/*
+			 * Weak refutation is sufficient: a LEFT JOIN treats an ON
+			 * condition that is not true exactly like one that is false.
+			 */
+			if (predicate_refuted_by(list_make1(restrictinfo->clause),
+									 outerrel->baserestrictinfo,
+									 true))
+				join_cond_is_false = true;
+		}
+
+		/* Ignore if it's not a mergejoinable clause */
+		if (!restrictinfo->can_join ||
+			restrictinfo->mergeopfamilies == NIL)
+			continue;			/* not mergejoinable */
+
+		/*
+		 * Check if the clause has the form "outer op inner" or "inner op
+		 * outer", and if so mark which side is inner.
+		 */
+		if (!clause_sides_match_join(restrictinfo, sjinfo->min_lefthand,
+									 innerrel->relids))
+			continue;			/* no good for these input relations */
+
+		/* OK, add to list */
+		clause_list = lappend(clause_list, restrictinfo);
+	}
+
+	/*
+	 * Before we go to the effort of checking whether any innerrel variables
+	 * are needed above the join, make a quick check to eliminate cases in
+	 * which we will surely be unable to prove uniqueness of the innerrel.
+	 * (If the join is provably false, we don't rely on uniqueness at all.)
+	 */
+	if (!join_cond_is_false && !rel_supports_distinctness(root, innerrel))
+		return false;
+
+	/*
 	 * We can't remove the join if any inner-rel attributes are used above the
 	 * join.  Here, "above" the join includes pushed-down conditions, so we
 	 * should reject if attr_needed includes the OJ's own relid; therefore,
-	 * compare to inputrelids not joinrelids.
+	 * compare to inputrelids not joinrelids.  If the join is provably false,
+	 * however, we replace inner-rel Vars in the query with NULLs below, so
+	 * top-level ("relation 0") references are acceptable too.
 	 *
 	 * As a micro-optimization, it seems better to start with max_attr and
 	 * count down rather than starting with min_attr and counting up, on the
 	 * theory that the system attributes are somewhat less likely to be wanted
 	 * and should be tested last.
 	 */
+	allowed = join_cond_is_false ? bms_add_member(bms_copy(inputrelids), 0)
+		: inputrelids;
 	for (attroff = innerrel->max_attr - innerrel->min_attr;
 		 attroff >= 0;
 		 attroff--)
 	{
-		if (!bms_is_subset(innerrel->attr_needed[attroff], inputrelids))
+		if (!bms_is_subset(innerrel->attr_needed[attroff], allowed))
 			return false;
 	}
 
@@ -303,52 +494,18 @@ join_is_removable(PlannerInfo *root, SpecialJoinInfo *sjinfo)
 			return false;		/* contained expression references innerrel */
 	}
 
-	/*
-	 * Search for mergejoinable clauses that constrain the inner rel against
-	 * either the outer rel or a pseudoconstant.  If an operator is
-	 * mergejoinable then it behaves like equality for some btree opclass, so
-	 * it's what we want.  The mergejoinability test also eliminates clauses
-	 * containing volatile functions, which we couldn't depend on.
-	 */
-	foreach(l, innerrel->joininfo)
+	if (join_cond_is_false)
 	{
-		RestrictInfo *restrictinfo = (RestrictInfo *) lfirst(l);
-
 		/*
-		 * If the current join commutes with some other outer join(s) via
-		 * outer join identity 3, there will be multiple clones of its join
-		 * clauses in the joininfo list.  We want to consider only the
-		 * has_clone form of such clauses.  Processing more than one form
-		 * would be wasteful, and also some of the others would confuse the
-		 * RINFO_IS_PUSHED_DOWN test below.
+		 * The cached AggInfos still reference the inner relation, and
+		 * null_out_rel_in_query() cannot update them.  Refuse to remove the
+		 * join in that case rather than leave a dangling reference behind.
 		 */
-		if (restrictinfo->is_clone)
-			continue;			/* ignore it */
+		if (rel_referenced_by_aggrefs(root, innerrelid))
+			return false;
 
-		/*
-		 * If it's not a join clause for this outer join, we can't use it.
-		 * Note that if the clause is pushed-down, then it is logically from
-		 * above the outer join, even if it references no other rels (it might
-		 * be from WHERE, for example).
-		 */
-		if (RINFO_IS_PUSHED_DOWN(restrictinfo, joinrelids))
-			continue;			/* ignore; not useful here */
-
-		/* Ignore if it's not a mergejoinable clause */
-		if (!restrictinfo->can_join ||
-			restrictinfo->mergeopfamilies == NIL)
-			continue;			/* not mergejoinable */
-
-		/*
-		 * Check if the clause has the form "outer op inner" or "inner op
-		 * outer", and if so mark which side is inner.
-		 */
-		if (!clause_sides_match_join(restrictinfo, sjinfo->min_lefthand,
-									 innerrel->relids))
-			continue;			/* no good for these input relations */
-
-		/* OK, add to list */
-		clause_list = lappend(clause_list, restrictinfo);
+		null_out_rel_in_query(root, innerrel);
+		return true;
 	}
 
 	/*
@@ -687,6 +844,7 @@ rel_is_distinct_for(PlannerInfo *root, RelOptInfo *rel, List *clause_list,
 		Query	   *subquery = root->simple_rte_array[relid]->subquery;
 		List	   *distinct_cols = NIL;
 		ListCell   *l;
+		bool		res;
 
 		/*
 		 * Build the argument list for query_is_distinct_for_with_collations:
@@ -745,8 +903,9 @@ rel_is_distinct_for(PlannerInfo *root, RelOptInfo *rel, List *clause_list,
 			distinct_cols = lappend(distinct_cols, dcinfo);
 		}
 
-		if (query_is_distinct_for_with_collations(subquery, distinct_cols))
-			return true;
+		res = query_is_distinct_for_with_collations(rel->subroot, subquery, distinct_cols);
+		list_free_deep(distinct_cols);
+		return res;
 	}
 	return false;
 }
@@ -785,6 +944,29 @@ query_supports_distinctness(Query *query)
 
 /*
  * query_is_distinct_for - ABI-preserving wrapper around
+ *		query_is_distinct_for_ext().
+ *
+ * Pass NULL as PlannerInfo and list of invalid oids as collation ids for old callers.
+ */
+bool
+query_is_distinct_for(Query *query, List *colnos, List *opids)
+{
+	List 	 *collids = list_copy(opids);
+	ListCell *lc;
+	bool 	 res;
+
+	foreach(lc, collids)
+	{
+		lfirst_oid(lc) = InvalidOid;
+	}
+
+	res = query_is_distinct_for_ext(NULL, query, colnos, opids, collids);
+	list_free(collids);
+	return res;
+}
+
+/*
+ * query_is_distinct_for_ext - ABI-preserving wrapper around
  *		query_is_distinct_for_with_collations().
  *
  * The original signature took parallel colnos/opids lists and did not
@@ -792,27 +974,36 @@ query_supports_distinctness(Query *query)
  * releases continue to call it with the historical (collation-blind)
  * semantics; we forward with InvalidOid collations, which makes the
  * collation check a no-op (see collations_agree_on_equality()).
+ *
+ * PlannerInfo for subqueries are required since they contain
+ * processed_groupClause and processed_distinctClause.
  */
 bool
-query_is_distinct_for(Query *query, List *colnos, List *opids)
+query_is_distinct_for_ext(PlannerInfo *subroot, Query *query,
+						  List *colnos, List *opids, List *collids)
 {
 	List	   *distinct_cols = NIL;
 	ListCell   *lc1;
 	ListCell   *lc2;
+	ListCell   *lc3;
+	bool		res;
 
-	Assert(list_length(colnos) == list_length(opids));
+	Assert(list_length(colnos) == list_length(opids) &&
+		   list_length(colnos) == list_length(collids));
 
-	forboth(lc1, colnos, lc2, opids)
+	forthree(lc1, colnos, lc2, opids, lc3, collids)
 	{
 		DistinctColInfo *dcinfo = palloc(sizeof(DistinctColInfo));
 
 		dcinfo->colno = lfirst_int(lc1);
 		dcinfo->opid = lfirst_oid(lc2);
-		dcinfo->collid = InvalidOid;
+		dcinfo->collid = lfirst_oid(lc3);
 		distinct_cols = lappend(distinct_cols, dcinfo);
 	}
 
-	return query_is_distinct_for_with_collations(query, distinct_cols);
+	res = query_is_distinct_for_with_collations(subroot, query, distinct_cols);
+	list_free_deep(distinct_cols);
+	return res;
 }
 
 /*
@@ -844,9 +1035,10 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
  * which case both reduce equality to byte-equality; see CREATE COLLATION).
  */
 static bool
-query_is_distinct_for_with_collations(Query *query, List *distinct_cols)
+query_is_distinct_for_with_collations(PlannerInfo *subroot, Query *query, List *distinct_cols)
 {
 	ListCell   *l;
+	List	   *sort_group_clauses;
 	DistinctColInfo *dcinfo;
 
 	/*
@@ -862,7 +1054,15 @@ query_is_distinct_for_with_collations(Query *query, List *distinct_cols)
 	if (query->distinctClause &&
 		!(query->hasTargetSRFs && query->hasDistinctOn))
 	{
-		foreach(l, query->distinctClause)
+		sort_group_clauses = query->distinctClause;
+
+		if (subroot != NULL)
+		{
+			Assert(IsA(subroot, PlannerInfo));
+			sort_group_clauses = subroot->processed_distinctClause;
+		}
+
+		foreach(l, sort_group_clauses)
 		{
 			SortGroupClause *sgc = (SortGroupClause *) lfirst(l);
 			TargetEntry *tle = get_sortgroupclause_tle(sgc,
@@ -895,7 +1095,15 @@ query_is_distinct_for_with_collations(Query *query, List *distinct_cols)
 	 */
 	if (query->groupClause && !query->groupingSets)
 	{
-		foreach(l, query->groupClause)
+		sort_group_clauses = query->groupClause;
+
+		if (subroot != NULL)
+		{
+			Assert(IsA(subroot, PlannerInfo));
+			sort_group_clauses = subroot->processed_groupClause;
+		}
+
+		foreach(l, sort_group_clauses)
 		{
 			SortGroupClause *sgc = (SortGroupClause *) lfirst(l);
 			TargetEntry *tle = get_sortgroupclause_tle(sgc,

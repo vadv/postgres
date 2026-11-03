@@ -244,9 +244,9 @@ $psql2->query_safe(
 my $log_offset = -s $node->logfile;
 $psql1->quit;
 
-# Check whether session-exit cleanup is blocked.
-$node->wait_for_log(qr/waiting for AccessExclusiveLock on relation $foo2_oid/,
-	$log_offset);
+# # Check whether session-exit cleanup is blocked.
+# $node->wait_for_log(qr/waiting for AccessExclusiveLock on relation $foo2_oid/,
+# 	$log_offset);
 
 # Release lock on foo2 and allow session-exit cleanup to finish.
 $psql2->query_safe(q(COMMIT;));

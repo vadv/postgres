@@ -3630,7 +3630,8 @@ sys.exit(sp.returncode)
        test_initdb_template,
        temp_install_bindir / 'initdb',
        '--auth', 'trust', '--no-sync', '--no-instructions', '--lc-messages=C',
-       '--no-clean'
+       '--no-clean',
+       '--no-autoconfig',
      ],
      priority: setup_tests_priority - 1,
      timeout: 300,
