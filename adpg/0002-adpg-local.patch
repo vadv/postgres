@@ -1,0 +1,37 @@
+diff --git a/contrib/Makefile b/contrib/Makefile
+index cffda2f..a964eea 100644
+--- a/contrib/Makefile
++++ b/contrib/Makefile
+@@ -47,7 +47,6 @@ SUBDIRS = \
+ 		pgrowlocks	\
+ 		pgstattuple	\
+ 		pg_visibility	\
+-		pg_wait_sampling	\
+ 		pg_walinspect	\
+ 		postgres_fdw	\
+ 		seg		\
+diff --git a/contrib/meson.build b/contrib/meson.build
+index b1784a3..e8d2e82 100644
+--- a/contrib/meson.build
++++ b/contrib/meson.build
+@@ -61,7 +61,6 @@ subdir('pgstattuple')
+ subdir('pg_surgery')
+ subdir('pg_trgm')
+ subdir('pg_visibility')
+-subdir('pg_wait_sampling')
+ subdir('pg_walinspect')
+ subdir('plantuner')
+ subdir('postgres_fdw')
+diff --git a/src/bin/initdb/initdb.c b/src/bin/initdb/initdb.c
+index 6086e8f..6f3d546 100644
+--- a/src/bin/initdb/initdb.c
++++ b/src/bin/initdb/initdb.c
+@@ -170,7 +170,7 @@ static char *xlog_dir = NULL;
+ static int	wal_segment_size_mb = (DEFAULT_XLOG_SEG_SIZE) / (1024 * 1024);
+ static DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
+ static bool sync_data_files = true;
+-static bool autoconfig = true;
++static bool autoconfig = false;
+ 
+ 
+ /* internal vars */
