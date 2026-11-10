@@ -170,7 +170,7 @@ static char *xlog_dir = NULL;
 static int	wal_segment_size_mb = (DEFAULT_XLOG_SEG_SIZE) / (1024 * 1024);
 static DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 static bool sync_data_files = true;
-static bool autoconfig = true;
+static bool autoconfig = false;
 
 
 /* internal vars */
