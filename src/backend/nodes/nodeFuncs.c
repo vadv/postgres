@@ -2945,8 +2945,13 @@ range_table_entry_walker_impl(RangeTblEntry *rte,
 Node *
 expression_tree_mutator_impl(Node *node,
 							 tree_mutator_callback mutator,
-							 void *context, int flags)
+							 void *context)
 {
+	const int	flags = 0;
+
+	StaticAssertStmt(QTW_DONT_COPY_DEFAULT == 0,
+					 "nonzero 1C mutator flag requires review");
+
 	/*
 	 * The mutator has already decided not to modify the current node, but we
 	 * must call the mutator for any sub-nodes.
