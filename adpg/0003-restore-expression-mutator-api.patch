@@ -1,0 +1,54 @@
+Subject: [PATCH] Restore the upstream expression mutator API for pgrx
+
+pgrx-pg-sys 0.18.1 fails to build TimescaleDB Toolkit because 1C added a
+fourth argument to expression_tree_mutator_impl.
+
+The flags argument has no effect while QTW_DONT_COPY_DEFAULT is zero.
+Restore the upstream signature and keep flags = 0 inside the function.
+
+---
+diff --git a/src/backend/nodes/nodeFuncs.c b/src/backend/nodes/nodeFuncs.c
+index 4434bb6..108d110 100644
+--- a/src/backend/nodes/nodeFuncs.c
++++ b/src/backend/nodes/nodeFuncs.c
+@@ -2945,8 +2945,13 @@ range_table_entry_walker_impl(RangeTblEntry *rte,
+ Node *
+ expression_tree_mutator_impl(Node *node,
+ 							 tree_mutator_callback mutator,
+-							 void *context, int flags)
++							 void *context)
+ {
++	const int	flags = 0;
++
++	StaticAssertStmt(QTW_DONT_COPY_DEFAULT == 0,
++					 "nonzero 1C mutator flag requires review");
++
+ 	/*
+ 	 * The mutator has already decided not to modify the current node, but we
+ 	 * must call the mutator for any sub-nodes.
+diff --git a/src/include/nodes/nodeFuncs.h b/src/include/nodes/nodeFuncs.h
+index 2f3415c..3816aa3 100644
+--- a/src/include/nodes/nodeFuncs.h
++++ b/src/include/nodes/nodeFuncs.h
+@@ -156,9 +156,10 @@ extern bool check_functions_in_node(Node *node, check_function_callback checker,
+ #define expression_tree_walker(n, w, c) \
+ 	expression_tree_walker_impl(n, (tree_walker_callback) (w), c)
+ #define expression_tree_mutator(n, m, c) \
+-	expression_tree_mutator_impl(n, (tree_mutator_callback) (m), c, 0)
++	expression_tree_mutator_impl(n, (tree_mutator_callback) (m), c)
++/* shortcut: ignore 1C's zero mask; revisit if QTW_DONT_COPY_DEFAULT changes. */
+ #define expression_tree_mutator_ext(n, m, c, f) \
+-	expression_tree_mutator_impl(n, (tree_mutator_callback) (m), c, f)
++	expression_tree_mutator(n, m, c)
+ 
+ 
+ #define query_tree_walker(q, w, c, f) \
+@@ -190,7 +191,7 @@ extern bool expression_tree_walker_impl(Node *node,
+ 										void *context);
+ extern Node *expression_tree_mutator_impl(Node *node,
+ 										  tree_mutator_callback mutator,
+-										  void *context, int flags);
++										  void *context);
+ 
+ extern bool query_tree_walker_impl(Query *query,
+ 								   tree_walker_callback walker,
