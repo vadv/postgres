@@ -156,10 +156,9 @@ extern bool check_functions_in_node(Node *node, check_function_callback checker,
 #define expression_tree_walker(n, w, c) \
 	expression_tree_walker_impl(n, (tree_walker_callback) (w), c)
 #define expression_tree_mutator(n, m, c) \
-	expression_tree_mutator_impl(n, (tree_mutator_callback) (m), c)
-/* shortcut: ignore 1C's zero mask; revisit if QTW_DONT_COPY_DEFAULT changes. */
+	expression_tree_mutator_impl(n, (tree_mutator_callback) (m), c, 0)
 #define expression_tree_mutator_ext(n, m, c, f) \
-	expression_tree_mutator(n, m, c)
+	expression_tree_mutator_impl(n, (tree_mutator_callback) (m), c, f)
 
 
 #define query_tree_walker(q, w, c, f) \
@@ -191,7 +190,7 @@ extern bool expression_tree_walker_impl(Node *node,
 										void *context);
 extern Node *expression_tree_mutator_impl(Node *node,
 										  tree_mutator_callback mutator,
-										  void *context);
+										  void *context, int flags);
 
 extern bool query_tree_walker_impl(Query *query,
 								   tree_walker_callback walker,
